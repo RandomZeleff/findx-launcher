@@ -1,0 +1,46 @@
+# Build + publication des installeurs sur GitHub Releases (dépôt = racine findx-app).
+# Déclencheur : tag app-v* ou lancement manuel (Actions). Après le dev, commiter, puis
+# pnpm run release (bump, tag, push) pour lancer la CI.
+name: build-findx-app
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "app-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-findx-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build and publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm run dist:publish
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: findx-blobs-${{ matrix.os }}
+          path: release/*
+          if-no-files-found: warn

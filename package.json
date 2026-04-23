@@ -16,6 +16,15 @@
   "bugs": {
     "url": "https://github.com/randomzeleff/findx-launcher/issues"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "node-datachannel",
+      "utp-native",
+      "bufferutil",
+      "utf-8-validate"
+    ]
+  },
   "scripts": {
     "dev": "vite",
     "icons": "node scripts/app-icon.mjs",
