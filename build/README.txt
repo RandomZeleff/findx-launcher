@@ -1,7 +1,9 @@
 Icône FindX (electron-builder)
 ================================
 
-Chaîne : pnpm run icons  →  icon.png + icon.ico (générés, ignorés par git)
+Chaîne : pnpm run icons  →  icon.png + icon.ico (générés en local, puis
+commitez-les : dist:publish / CI n’exécute pas le script, ils doivent être
+présents dans le dépôt pour electron-builder.
 
 Sources (ordre de priorité dans scripts/app-icon.mjs) :
 

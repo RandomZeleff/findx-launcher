@@ -9,10 +9,12 @@ dist-electron
 # Installateurs & paquets electron-builder
 release
 
-# Dossier build : seules les sources d’icône / doc sont suivies (le reste est généré ou local)
+# Dossier build : sources + binaires d’icône versionnés (générés en local, pas en CI)
 build/*
 !build/README.txt
 !build/icon-text.svg
+!build/icon.png
+!build/icon.ico
 
 # Environnement local (URL, secrets machine)
 .env

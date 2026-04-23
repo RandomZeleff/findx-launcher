@@ -28,7 +28,8 @@
     "preview": "vite preview",
     "rebuild:native": "electron-rebuild -f",
     "postinstall": "electron-rebuild -f",
-    "dist:publish": "pnpm run icons && tsc -b && vite build && electron-builder --publish always"
+    "dist:publish": "tsc -b && vite build && electron-builder --publish always",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",
