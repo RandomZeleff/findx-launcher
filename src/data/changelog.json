@@ -1,0 +1,17 @@
+[
+  {
+    "version": "1.0.0",
+    "date": "2026-04-22",
+    "release": "minor",
+    "highlights": [
+      {
+        "type": "add",
+        "text": "Première version du lanceur FindX : accès au catalogue, téléchargements, bibliothèque locale et lancement des jeux installés."
+      },
+      {
+        "type": "add",
+        "text": "Parcours unifié entre le catalogue, la bibliothèque et les paramètres pour installer, lancer et suivre vos jeux."
+      }
+    ]
+  }
+]

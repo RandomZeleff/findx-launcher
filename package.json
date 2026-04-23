@@ -1,0 +1,116 @@
+{
+  "name": "findx-app",
+  "productName": "FindX",
+  "version": "1.0.0",
+  "description": "Launcher FindX — Télécharge/Gère tes jeux via torrent. Basé sur Online-Fix.me.",
+  "author": "Zeleff_",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/randomzeleff/findx-launcher.git"
+  },
+  "homepage": "https://github.com/randomzeleff/findx-launcher#readme",
+  "bugs": {
+    "url": "https://github.com/randomzeleff/findx-launcher/issues"
+  },
+  "scripts": {
+    "dev": "vite",
+    "icons": "node scripts/app-icon.mjs",
+    "build": "pnpm run icons && tsc -b && vite build && electron-builder --publish never",
+    "build:vite": "tsc -b && vite build",
+    "build:win": "pnpm run icons && pnpm run build:vite && electron-builder --publish never --win",
+    "build:linux": "pnpm run icons && pnpm run build:vite && electron-builder --publish never --linux",
+    "build:mac": "pnpm run icons && pnpm run build:vite && electron-builder --publish never --mac",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "rebuild:native": "electron-rebuild -f",
+    "postinstall": "electron-rebuild -f",
+    "dist:publish": "pnpm run icons && tsc -b && vite build && electron-builder --publish always"
+  },
+  "dependencies": {
+    "7zip-bin": "^5.2.0",
+    "@mozilla/readability": "^0.6.0",
+    "electron-updater": "^6.6.2",
+    "embla-carousel-react": "^8.6.0",
+    "jsdom": "^29.0.2",
+    "lucide-react": "^1.8.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.14.1",
+    "vite-plugin-electron": "^0.29.1",
+    "vite-plugin-electron-renderer": "^0.14.6",
+    "webtorrent": "^2.8.5"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.2",
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "electron": "^41.2.0",
+    "electron-builder": "^26.0.12",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.4.0",
+    "postcss": "^8.5.10",
+    "sharp": "^0.34.5",
+    "tailwindcss": "^3.4.19",
+    "to-ico": "^1.1.5",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.0",
+    "vite": "^8.0.4"
+  },
+  "build": {
+    "appId": "app.zeleff.findx.launcher",
+    "productName": "FindX",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "asar": true,
+    "asarUnpack": [
+      "**/node_modules/7zip-bin/**",
+      "**/node_modules/node-datachannel/**",
+      "**/node_modules/utp-native/**"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "icon": "icon.png",
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game",
+      "synopsis": "Lanceur FindX — catalogue et téléchargement de jeux"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.games"
+    },
+    "nsis": {
+      "oneClick": true,
+      "differentialPackage": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "randomzeleff",
+      "repo": "findx-launcher"
+    }
+  }
+}

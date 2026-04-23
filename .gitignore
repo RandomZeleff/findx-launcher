@@ -1,0 +1,55 @@
+# Dépendances
+node_modules
+
+# Build Vite / Electron (jamais versionner le bundle)
+dist
+dist-ssr
+dist-electron
+
+# Installateurs & paquets electron-builder
+release
+
+# Dossier build : seules les sources d’icône / doc sont suivies (le reste est généré ou local)
+build/*
+!build/README.txt
+!build/icon-text.svg
+
+# Environnement local (URL, secrets machine)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Fichiers machine / outils
+*.local
+*.tsbuildinfo
+coverage
+.eslintcache
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Éditeurs / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+
+# Scripts
+scripts/

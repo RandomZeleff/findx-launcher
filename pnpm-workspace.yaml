@@ -1,0 +1,7 @@
+onlyBuiltDependencies:
+  - bufferutil
+  - electron
+  - electron-winstaller
+  - node-datachannel
+  - utf-8-validate
+  - utp-native

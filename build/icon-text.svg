@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Mot-symbole (texte) : editez le texte, couleurs, font-size. Pour polices fiables : Figma/Illustrator, outline le texte puis export SVG. -->
+  <!-- Texte: couleur accent = var globale (voir src/index.css) -->
+  <rect width="1024" height="1024" rx="200" fill="#1b2838"/>
+  <text
+    x="512"
+    y="560"
+    text-anchor="middle"
+    font-family="Segoe UI, system-ui, -apple-system, sans-serif"
+    font-weight="700"
+    font-size="220"
+    fill="#66c0f4"
+  >FindX</text>
+</svg>
