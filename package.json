@@ -19,6 +19,7 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "electron",
+      "electron-winstaller",
       "node-datachannel",
       "utp-native",
       "bufferutil",
