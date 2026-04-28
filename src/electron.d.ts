@@ -49,6 +49,15 @@ declare global {
           gameTitle: string,
           createShortcut?: boolean,
         ) => Promise<{ infoHash: string; destPath: string }>
+        addFromUrl: (
+          torrentUrl: string,
+          installRoot: string,
+          gameId: string,
+          gameTitle: string,
+          createShortcut?: boolean,
+          requestId?: string | null,
+        ) => Promise<{ infoHash: string; destPath: string }>
+        cancelAddFromUrl: (requestId: string) => Promise<{ ok: boolean }>
         pause:    (infoHash: string) => Promise<{ ok: boolean }>
         resume:   (infoHash: string) => Promise<{ ok: boolean }>
         remove:   (infoHash: string) => Promise<{ ok: boolean }>

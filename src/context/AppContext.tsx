@@ -297,6 +297,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const dlStartsRef      = useRef<Record<string, number>>({})
   // Set of paused infoHashes — O(1) lookup in the onProgress hot path
   const pausedHashesRef  = useRef<Set<string>>(new Set())
+  /** Regroupe les `torrent:progress` pour limiter les re-renders React (surtout avec plusieurs seeds / téléchargements). */
+  const progressPendingRef = useRef<Map<string, TorrentProgressEvent>>(new Map())
+  const progressTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const seedPendingRef     = useRef<Map<string, { infoHash: string; uploadSpeed: number; uploaded: number; numPeers: number }>>(new Map())
+  const seedTimerRef       = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Enhanced dispatch: intercepts actions to maintain side-channel refs
   const dispatch = useCallback((action: Action) => {
@@ -359,56 +364,71 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const torrent = (window as Window & { electron?: typeof window.electron }).electron?.torrent
     if (!torrent) return
 
+    const flushTorrentProgress = () => {
+      progressTimerRef.current = null
+      const batch = progressPendingRef.current
+      progressPendingRef.current = new Map()
+      for (const ev of batch.values()) {
+        const prev = stateRef.current.downloads.find(d => d.infoHash === ev.infoHash)
+        if (prev?.status === 'extracting' || prev?.status === 'done' || prev?.status === 'failed') continue
+
+        if (pausedHashesRef.current.has(ev.infoHash)) {
+          dispatch({
+            type: 'UPDATE_TORRENT',
+            payload: {
+              infoHash:    ev.infoHash,
+              numPeers:    ev.numPeers,
+              uploadSpeed: ev.uploadSpeed,
+            },
+          })
+          continue
+        }
+
+        if (prev?.status === 'stalled') {
+          dispatch({
+            type: 'UPDATE_TORRENT',
+            payload: {
+              infoHash:        ev.infoHash,
+              progress:        ev.progress,
+              downloadSpeed:   ev.downloadSpeed,
+              downloaded:      ev.downloaded,
+              length:          ev.length,
+              timeRemaining:   ev.timeRemaining,
+              numPeers:        ev.numPeers,
+              uploadSpeed:     ev.uploadSpeed,
+            },
+          })
+          continue
+        }
+
+        const hasMeta = ev.length > 0 && Number.isFinite(ev.length)
+        const stayConnecting =
+          prev?.status === 'connecting' && !hasMeta && (ev.progress ?? 0) < 0.0001
+        dispatch({
+          type: 'UPDATE_TORRENT',
+          payload: {
+            infoHash:      ev.infoHash,
+            status:        stayConnecting ? 'connecting' : 'downloading',
+            progress:      ev.progress,
+            downloadSpeed: ev.downloadSpeed,
+            downloaded:    ev.downloaded,
+            length:        ev.length,
+            timeRemaining: ev.timeRemaining,
+            numPeers:      ev.numPeers,
+            uploadSpeed:   ev.uploadSpeed,
+          },
+        })
+      }
+    }
+
+    const scheduleTorrentProgress = () => {
+      if (progressTimerRef.current != null) return
+      progressTimerRef.current = setTimeout(flushTorrentProgress, 200)
+    }
+
     const offProgress = torrent.onProgress((ev) => {
-      const prev = stateRef.current.downloads.find(d => d.infoHash === ev.infoHash)
-      if (prev?.status === 'extracting' || prev?.status === 'done' || prev?.status === 'failed') return
-
-      if (pausedHashesRef.current.has(ev.infoHash)) {
-        dispatch({
-          type: 'UPDATE_TORRENT',
-          payload: {
-            infoHash:    ev.infoHash,
-            numPeers:    ev.numPeers,
-            uploadSpeed: ev.uploadSpeed,
-          },
-        })
-        return
-      }
-
-      if (prev?.status === 'stalled') {
-        dispatch({
-          type: 'UPDATE_TORRENT',
-          payload: {
-            infoHash:        ev.infoHash,
-            progress:        ev.progress,
-            downloadSpeed:   ev.downloadSpeed,
-            downloaded:      ev.downloaded,
-            length:          ev.length,
-            timeRemaining:   ev.timeRemaining,
-            numPeers:        ev.numPeers,
-            uploadSpeed:     ev.uploadSpeed,
-          },
-        })
-        return
-      }
-
-      const hasMeta = ev.length > 0 && Number.isFinite(ev.length)
-      const stayConnecting =
-        prev?.status === 'connecting' && !hasMeta && (ev.progress ?? 0) < 0.0001
-      dispatch({
-        type: 'UPDATE_TORRENT',
-        payload: {
-          infoHash:      ev.infoHash,
-          status:        stayConnecting ? 'connecting' : 'downloading',
-          progress:      ev.progress,
-          downloadSpeed: ev.downloadSpeed,
-          downloaded:    ev.downloaded,
-          length:        ev.length,
-          timeRemaining: ev.timeRemaining,
-          numPeers:      ev.numPeers,
-          uploadSpeed:   ev.uploadSpeed,
-        },
-      })
+      progressPendingRef.current.set(ev.infoHash, ev)
+      scheduleTorrentProgress()
     })
 
     const offDone = torrent.onDone((ev) => {
@@ -474,7 +494,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
     })
 
-    return () => { offProgress(); offDone(); offExtracting(); offSlow?.(); offError() }
+    return () => {
+      if (progressTimerRef.current) {
+        clearTimeout(progressTimerRef.current)
+        progressTimerRef.current = null
+      }
+      progressPendingRef.current.clear()
+      offProgress()
+      offDone()
+      offExtracting()
+      offSlow?.()
+      offError()
+    }
   }, [dispatch])
 
   // ── Seed IPC listeners ────────────────────────────────────────────────────
@@ -482,16 +513,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const torrent = (window as Window & { electron?: typeof window.electron }).electron?.torrent
     if (!torrent) return
 
+    const flushSeedProgress = () => {
+      seedTimerRef.current = null
+      const batch = seedPendingRef.current
+      seedPendingRef.current = new Map()
+      for (const ev of batch.values()) {
+        dispatch({
+          type: 'UPDATE_SEED',
+          payload: {
+            infoHash:    ev.infoHash,
+            uploadSpeed: ev.uploadSpeed,
+            uploaded:    ev.uploaded,
+            numPeers:    ev.numPeers,
+          },
+        })
+      }
+    }
+
+    const scheduleSeedProgress = () => {
+      if (seedTimerRef.current != null) return
+      seedTimerRef.current = setTimeout(flushSeedProgress, 400)
+    }
+
     const offSeedProgress = torrent.onSeedProgress((ev) => {
-      dispatch({
-        type: 'UPDATE_SEED',
-        payload: {
-          infoHash:    ev.infoHash,
-          uploadSpeed: ev.uploadSpeed,
-          uploaded:    ev.uploaded,
-          numPeers:    ev.numPeers,
-        },
-      })
+      seedPendingRef.current.set(ev.infoHash, ev)
+      scheduleSeedProgress()
     })
 
     const offSeedStopped = torrent.onSeedStopped((ev) => {
@@ -514,7 +560,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       })
     })
 
-    return () => { offSeedProgress(); offSeedStopped(); offAutoSeed() }
+    return () => {
+      if (seedTimerRef.current) {
+        clearTimeout(seedTimerRef.current)
+        seedTimerRef.current = null
+      }
+      seedPendingRef.current.clear()
+      offSeedProgress()
+      offSeedStopped()
+      offAutoSeed()
+    }
   }, [dispatch])
 
   // ── Auto-restart seeding on app start ─────────────────────────────────────

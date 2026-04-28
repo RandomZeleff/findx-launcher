@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { X, Download, Eye, Calendar, Gamepad2, ExternalLink, Play, Pause, FolderOpen, RotateCcw, Archive, Trash2, AlertTriangle, Loader2, Square, Clock, RefreshCw, WifiOff } from 'lucide-react'
 import { gamesApi, type Game } from '../../api/games'
-import { proxyImageUrl } from '../../api/client'
+import { getApiBase, proxyImageUrl } from '../../api/client'
 import { useApp } from '../../context/AppContext'
 import { Spinner } from '../ui/Spinner'
 import { CATEGORY_LABELS, CATEGORY_COLORS } from '../../lib/categories'
@@ -80,18 +80,13 @@ export function GameDetailPanel({ gameId, onClose, extraActions }: GameDetailPan
 
   if (!gameId) return null
 
-  async function getTorrentSource(id: string): Promise<ArrayBuffer> {
-    return gamesApi.getTorrent(id)
-  }
-
   async function handleDownload() {
     if (!game) return
     setFetching(true)
     setFetchError(null)
     try {
-      const torrentBuffer = await getTorrentSource(game.id)
-      const { infoHash, destPath } = await window.electron.torrent.add(
-        torrentBuffer,
+      const { infoHash, destPath } = await window.electron.torrent.addFromUrl(
+        `${getApiBase()}/api/games/${game.id}/torrent`,
         state.downloadDir,
         game.id,
         game.title_clean,
@@ -128,9 +123,12 @@ export function GameDetailPanel({ gameId, onClose, extraActions }: GameDetailPan
     try {
       try { await window.electron.torrent.remove(activeDownload.infoHash) } catch { /* already gone */ }
       dispatch({ type: 'REMOVE_TORRENT', payload: activeDownload.infoHash })
-      const torrentBuffer = await getTorrentSource(game.id)
-      const { infoHash, destPath } = await window.electron.torrent.add(
-        torrentBuffer, state.downloadDir, game.id, game.title_clean, getBoolPref(PREF_AUTO_SHORTCUT, true),
+      const { infoHash, destPath } = await window.electron.torrent.addFromUrl(
+        `${getApiBase()}/api/games/${game.id}/torrent`,
+        state.downloadDir,
+        game.id,
+        game.title_clean,
+        getBoolPref(PREF_AUTO_SHORTCUT, true),
       )
       dispatch({
         type: 'ADD_TORRENT',
@@ -168,9 +166,8 @@ export function GameDetailPanel({ gameId, onClose, extraActions }: GameDetailPan
       }
       dispatch({ type: 'REMOVE_INSTALLATION', payload: game.id })
 
-      const torrentBuffer = await getTorrentSource(game.id)
-      const { infoHash, destPath } = await window.electron.torrent.add(
-        torrentBuffer,
+      const { infoHash, destPath } = await window.electron.torrent.addFromUrl(
+        `${getApiBase()}/api/games/${game.id}/torrent`,
         state.downloadDir,
         game.id,
         game.title_clean,

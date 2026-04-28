@@ -69,8 +69,29 @@ contextBridge.exposeInMainWorld('electron', {
 
   // Torrent management
   torrent: {
-    add: (buffer: ArrayBuffer, installRoot: string, gameId: number, gameTitle: string, createShortcut = true) =>
-      ipcRenderer.invoke('torrent:add', buffer, installRoot, gameId, gameTitle, createShortcut),
+    add: (source: string | ArrayBuffer, installRoot: string, gameId: string, gameTitle: string, createShortcut = true) =>
+      ipcRenderer.invoke('torrent:add', source, installRoot, gameId, gameTitle, createShortcut),
+
+    addFromUrl: (
+      torrentUrl: string,
+      installRoot: string,
+      gameId: string,
+      gameTitle: string,
+      createShortcut = true,
+      requestId?: string | null,
+    ) =>
+      ipcRenderer.invoke(
+        'torrent:addFromUrl',
+        torrentUrl,
+        installRoot,
+        gameId,
+        gameTitle,
+        createShortcut,
+        requestId ?? null,
+      ),
+
+    cancelAddFromUrl: (requestId: string) =>
+      ipcRenderer.invoke('torrent:cancelAddFromUrl', requestId) as Promise<{ ok: boolean }>,
 
     pause: (infoHash: string) =>
       ipcRenderer.invoke('torrent:pause', infoHash),

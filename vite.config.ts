@@ -35,6 +35,16 @@ export default defineConfig({
         },
       },
       {
+        entry: 'electron/torrentWorker.ts',
+        vite: {
+          build: {
+            rollupOptions: {
+              external: ['electron', 'webtorrent', '7zip-bin', 'jsdom', '@mozilla/readability', 'electron-updater'],
+            },
+          },
+        },
+      },
+      {
         entry: 'electron/preload.ts',
         onstart(options) {
           options.reload()

@@ -3,8 +3,13 @@ import fs from 'node:fs/promises'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'node:module'
 import { spawn } from 'child_process'
+import type { ChildProcess, SpawnOptions } from 'child_process'
 import path from 'path'
 import { fetchArticlePlainText } from './articleReader'
+import { registerTorrentFinalizeContext, torrentWorker } from './torrentWorkerBridge'
+
+/** Concatène stderr/stdout en ne gardant que la fin — évite de saturer la mémoire et le GC (7-Zip liste des milliers de fichiers). */
+const EXTRACT_LOG_TAIL_MAX = 16_384
 
 const _require = createRequire(import.meta.url)
 /** CJS : import ESM `from 'electron-updater'` casse au runtime (named exports). */
@@ -60,115 +65,9 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
 let win: BrowserWindow | null = null
 
-// ── WebTorrent client (lazy-loaded) ──────────────────────────────────────────
-/** Sous-ensemble du client WebTorrent utilisé dans les handlers IPC. */
-interface WtClientLite {
-  add: (src: string | Buffer, opts: Record<string, unknown>) => unknown
-  get: (infoHash: string) => Promise<unknown>
-  remove: (infoHash: string, opts?: { destroyStore?: boolean }) => Promise<void>
-}
-
-let _wtClient: WtClientLite | null = null
-
-async function getWtClient(): Promise<WtClientLite> {
-  if (_wtClient) return _wtClient
-  const { default: WebTorrent } = await import('webtorrent')
-  // maxConns ↑ : plus de connexions TCP/uTP simultanées (défaut 55) — utile avec DHT/PEX.
-  _wtClient = new WebTorrent({ maxConns: 120 }) as WtClientLite
-  return _wtClient
-}
-
-// Progress throttle: send at most one event per second per torrent
-const _lastProgress: Record<string, number> = {}
-
-/** Snapshot pour l’UI (pairs, débit montant) — aligné sur l’info affichée dans qBittorrent. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function buildTorrentProgressPayload(torrent: any) {
-  const wiresLen = Array.isArray(torrent.wires) ? torrent.wires.length : 0
-  const numPeers =
-    typeof torrent.numPeers === 'number' && !Number.isNaN(torrent.numPeers)
-      ? torrent.numPeers
-      : wiresLen
-  return {
-    infoHash:      torrent.infoHash as string,
-    progress:      torrent.progress ?? 0,
-    downloadSpeed: torrent.downloadSpeed ?? 0,
-    downloaded:    torrent.downloaded ?? 0,
-    length:        torrent.length ?? 0,
-    timeRemaining: torrent.timeRemaining ?? 0,
-    numPeers,
-    uploadSpeed:   torrent.uploadSpeed ?? 0,
-  }
-}
-
 /** Racine par défaut : Documents/FindX/Installations (un sous-dossier par jeu). */
 function getDefaultInstallRoot(): string {
   return path.join(app.getPath('documents'), 'FindX', 'Installations')
-}
-
-function sanitizeGameFolderName(gameId: string, gameTitle: string): string {
-  const raw = (`${gameId}-${gameTitle}`).trim() || `game-${gameId}`
-  const illegal = new Set(Array.from('<>:"/\\|?*'))
-  const safe = [...raw]
-    .map(ch => {
-      const cp = ch.codePointAt(0) ?? 0
-      return cp < 0x20 || illegal.has(ch) ? '_' : ch
-    })
-    .join('')
-    .replace(/\.+$/, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 100)
-  return safe || `game-${gameId}`
-}
-
-/** Vérifie que chaque fichier (hors entrées 0 octet) a la bonne taille sur disque — évite « terminé » avec .rar vide. */
-async function verifyTorrentFilesOnDisk(torrent: {
-  destroyed?: boolean
-  path: string
-  files: Array<{ path: string; length: number }>
-}): Promise<boolean> {
-  if (!torrent.files?.length) return true
-  for (const f of torrent.files) {
-    if (f.length === 0) continue
-    const fullPath = path.join(torrent.path, f.path)
-    let st: Awaited<ReturnType<typeof fs.stat>>
-    try {
-      st = await fs.stat(fullPath)
-    } catch {
-      return false
-    }
-    if (st.size !== f.length) return false
-  }
-  return true
-}
-
-async function waitForTorrentFilesOnDisk(
-  torrent: { destroyed?: boolean; path: string; files: Array<{ path: string; length: number }> },
-  attempts = 30,
-  delayMs = 250,
-): Promise<boolean> {
-  for (let a = 0; a < attempts; a++) {
-    if (torrent.destroyed) return false
-    if (await verifyTorrentFilesOnDisk(torrent)) return true
-    await new Promise((r) => setTimeout(r, delayMs))
-  }
-  return false
-}
-
-/**
- * Si dest/ contient un unique sous-dossier (structure typique WebTorrent),
- * remonte son contenu d'un niveau : dest/Sub/file → dest/file
- */
-async function flattenSingleSubdir(dest: string): Promise<void> {
-  const entries = await fs.readdir(dest, { withFileTypes: true })
-  if (entries.length !== 1 || !entries[0].isDirectory()) return
-  const subdir = path.join(dest, entries[0].name)
-  for (const name of await fs.readdir(subdir)) {
-    await fs.rename(path.join(subdir, name), path.join(dest, name))
-  }
-  try { await fs.rmdir(subdir) } catch { /* ignore if not empty */ }
-  console.log('[flatten]', entries[0].name, '->', dest)
 }
 
 /** Vérifie les magic bytes pour s'assurer que le fichier est bien une archive valide. */
@@ -233,32 +132,47 @@ async function findMainArchive(searchRoot: string): Promise<string | null> {
   return null
 }
 
+function appendExtractLogTail(acc: { s: string }, chunk: Buffer) {
+  acc.s = (acc.s + chunk.toString('utf8')).slice(-EXTRACT_LOG_TAIL_MAX)
+}
+
+function runExtractorProcess(bin: string, args: string[], opts?: SpawnOptions): Promise<{ code: number | null; logTail: string }> {
+  return new Promise((resolve, reject) => {
+    const logTail = { s: '' }
+    const proc: ChildProcess = spawn(bin, args, {
+      windowsHide: true,
+      ...opts,
+    })
+    proc.stdout?.on('data', (c: Buffer) => appendExtractLogTail(logTail, c))
+    proc.stderr?.on('data', (c: Buffer) => appendExtractLogTail(logTail, c))
+    proc.once('close', (code) => resolve({ code, logTail: logTail.s.trim() }))
+    proc.once('error', reject)
+  })
+}
+
 async function runExtraction(archivePath: string, destDir: string): Promise<void> {
   const ext = await getExtractor()
+  // -bb0 / -bsp0 : moins de sortie console (sinon 7-Zip peut lister chaque fichier → Mo de texte et blocages du process principal).
   const args = ext.type === 'unrar'
-    ? ['x', archivePath, destDir + (destDir.endsWith('\\') ? '' : '\\'), `-p${ONLINEFIX_PASSWORD}`, '-o+', '-y']
-    : ['x', archivePath, `-p${ONLINEFIX_PASSWORD}`, `-o${destDir}`, '-y', '-aoa']
+    ? [
+        'x',
+        archivePath,
+        destDir + (destDir.endsWith('\\') ? '' : '\\'),
+        `-p${ONLINEFIX_PASSWORD}`,
+        '-o+',
+        '-y',
+        '-idq',
+      ]
+    : ['x', archivePath, `-p${ONLINEFIX_PASSWORD}`, `-o${destDir}`, '-y', '-aoa', '-bb0', '-bsp0']
 
   console.log('[extract] using', ext.type, ext.bin)
   console.log('[extract] args:', args)
 
-  return new Promise((resolve, reject) => {
-    const output: string[] = []
-    const proc = spawn(ext.bin, args)
-    proc.stdout?.on('data', (c: Buffer) => output.push(c.toString()))
-    proc.stderr?.on('data', (c: Buffer) => output.push(c.toString()))
-    proc.on('close', (code) => {
-      const log = output.join('').trim()
-      if (log) console.log('[extract] output:', log)
-      if (code === 0) {
-        resolve()
-      } else {
-        const detail = log.split('\n').slice(-6).join(' ').trim()
-        reject(new Error(`${ext.type} code ${code}${detail ? ` — ${detail}` : ''}`))
-      }
-    })
-    proc.on('error', reject)
-  })
+  const { code, logTail } = await runExtractorProcess(ext.bin, args)
+  if (logTail && code !== 0) console.log('[extract] tail:', logTail.slice(-800))
+  if (code === 0) return
+  const detail = logTail.split(/\r?\n/).slice(-8).join(' ').trim()
+  throw new Error(`${ext.type} code ${code}${detail ? ` — ${detail}` : ''}`)
 }
 
 // ── Exe finder & desktop shortcut ────────────────────────────────────────────
@@ -313,6 +227,21 @@ function createDesktopShortcut(exePath: string, gameTitle: string): string | nul
     return null
   }
 }
+
+/** Relais événements torrent (process worker) + extraction (ci-dessous). */
+function broadcastTorrentChannel(channel: string, payload: unknown) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send(channel, payload)
+  }
+}
+
+registerTorrentFinalizeContext({
+  broadcast: broadcastTorrentChannel,
+  findMainArchive,
+  runExtraction,
+  findGameExe,
+  createDesktopShortcut,
+})
 
 // ── Running game registry ─────────────────────────────────────────────────────
 // savePath (lowercase normalized) → { child process, exePath, poll timer }
@@ -397,10 +326,12 @@ function createWindow() {
     frame: false,
     backgroundColor: '#1b2838',
     titleBarStyle: 'hidden',
+    // Téléchargements / torrent lourds : évite que Chromium ralentisse l’UI quand la fenêtre n’a pas le focus.
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   })
 
@@ -419,6 +350,10 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
   win = null
+})
+
+app.on('before-quit', () => {
+  torrentWorker.kill()
 })
 
 app.on('activate', () => {
@@ -600,373 +535,81 @@ ipcMain.handle('dialog:selectInstallFolder', async () => {
   return canceled || !filePaths[0] ? null : filePaths[0]
 })
 
-// ── Torrent: add ──────────────────────────────────────────────────────────────
-// - storeCacheSlots: 0 → pas de CacheChunkStore (moins de risques d'écritures
-//   incomplètes / fichiers à 0 octet sur Windows avec le cache par défaut).
-// - Après l'événement `done`, on attend que les tailles sur disque correspondent
-//   au métier du torrent avant d'envoyer `torrent:done` au renderer.
+// ── Torrent : processus dédié WebTorrent (voir torrentWorker.ts) ────────────
+
+const _torrentAddFetchAborts = new Map<string, AbortController>()
+
+function resolveInstallRoot(userPath: string): string {
+  const t = userPath?.trim()
+  return t ? path.resolve(t) : getDefaultInstallRoot()
+}
 
 ipcMain.handle(
   'torrent:add',
   async (_e, source: string | ArrayBuffer, installRootUser: string, gameId: string, gameTitle: string, createShortcut = true) => {
-    const client = await getWtClient()
-    // Accept either a magnet URI string or a raw torrent ArrayBuffer
-    const torrentSource = typeof source === 'string' ? source : Buffer.from(source)
-    const root = installRootUser?.trim()
-      ? path.resolve(installRootUser.trim())
-      : getDefaultInstallRoot()
-    const dest = path.join(root, sanitizeGameFolderName(gameId, gameTitle))
-    await fs.mkdir(dest, { recursive: true })
-
-    return new Promise<{ infoHash: string; destPath: string }>((resolve, reject) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const torrent: any = client.add(torrentSource, {
-        path: dest,
-        storeCacheSlots: 0,
-        // Défaut WebTorrent = sequential : avec peu de seeders, on peut bloquer sur des
-        // pièces « en tête » que personne n’a. rarest-first limite ce cas (comportement type qBittorrent).
-        strategy: 'rarest',
-        // Un peu plus de slots d’upload pour le tit-for-tat (défaut 10).
-        uploads: 14,
-      })
-
-      let doneSent = false
-      let finalizeInFlight = false
-      let resolved = false
-      let watchdog: ReturnType<typeof setInterval> | null = null
-      let preReady: ReturnType<typeof setInterval> | null = null
-
-      const clearWatchdog = () => {
-        if (watchdog) {
-          clearInterval(watchdog)
-          watchdog = null
-        }
-      }
-
-      const clearPreReady = () => {
-        if (preReady) {
-          clearInterval(preReady)
-          preReady = null
-        }
-      }
-
-      // For magnet URIs, infoHash is parsed from the URI immediately — no need to
-      // wait for the 'ready' event (which only fires after fetching metadata from peers).
-      if (torrent.infoHash) {
-        resolve({ infoHash: torrent.infoHash as string, destPath: dest })
-        resolved = true
-      }
-
-      // Pendant l’obtention des métadonnées (magnet / DHT), envoyer le nombre de pairs au renderer.
-      preReady = setInterval(() => {
-        if (torrent.destroyed || doneSent) {
-          clearPreReady()
-          return
-        }
-        if (torrent.ready) {
-          clearPreReady()
-          return
-        }
-        const ih = torrent.infoHash as string | undefined
-        if (!ih || !win) return
-        win.webContents.send('torrent:progress', buildTorrentProgressPayload(torrent))
-      }, 2000)
-
-      const finalizeInstall = async () => {
-        if (doneSent || finalizeInFlight || torrent.destroyed) return
-        const ih = torrent.infoHash as string | undefined
-        if (!ih) return
-
-        finalizeInFlight = true
-        try {
-          const ok = await waitForTorrentFilesOnDisk(torrent, 35, 250)
-          if (torrent.destroyed) return
-          if (!ok) {
-            win?.webContents.send('torrent:error', {
-              infoHash: ih,
-              error:
-                'Fichiers incorrects sur le disque (0 octet ou taille invalide). ' +
-                'Réessaie ; si le problème continue, télécharge ce torrent avec qBittorrent.',
-            })
-            return
-          }
-          // Mark done BEFORE remove so watchdog doesn't re-fire
-          doneSent = true
-          clearWatchdog()
-          // Remove from client (destroyStore:false = keep files) to close all
-          // file handles on Windows — without this the ZIP stays locked/corrupt
-          try {
-            await client.remove(ih, { destroyStore: false })
-          } catch { /* ignore */ }
-          // Flatten dest/SubFolder/* → dest/* so archives are at the root level
-          try { await flattenSingleSubdir(dest) } catch (e) { console.warn('[flatten] error:', e) }
-          // Let Windows fully flush & release handles before extractor opens the archive
-          await new Promise(r => setTimeout(r, 800))
-
-          // Auto-extract the password-protected archive
-          const archivePath = await findMainArchive(dest)
-          if (archivePath) {
-            win?.webContents.send('torrent:extracting', { infoHash: ih })
-            try {
-              await runExtraction(archivePath, dest)
-            } catch (extractErr) {
-              win?.webContents.send('torrent:error', {
-                infoHash: ih,
-                error:    `Extraction échouée : ${(extractErr as Error).message}`,
-              })
-              return
-            }
-          }
-
-          // Find main exe and create desktop shortcut
-          const exePath      = await findGameExe(dest, gameTitle)
-          const shortcutPath = (createShortcut && exePath) ? createDesktopShortcut(exePath, gameTitle) : null
-
-          win?.webContents.send('torrent:done', {
-            infoHash: ih,
-            path:     dest,
-            exePath,
-            shortcutPath,
-          })
-
-          // Auto-start seeding after install (default behaviour).
-          // Re-add the same torrent source; WebTorrent verifies pieces on disk
-          // and immediately becomes a seeder — no re-download needed.
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- API dynamique WebTorrent
-            const seedT: any = client.add(torrentSource, { path: dest, storeCacheSlots: 0 })
-
-            const doAutoSeed = (seedIh: string) => {
-              const existing = _seedIntervals.get(seedIh)
-              if (existing) clearInterval(existing)
-              const interval = setInterval(() => {
-                if (seedT.destroyed) { clearInterval(interval); _seedIntervals.delete(seedIh); return }
-                win?.webContents.send('torrent:seedProgress', {
-                  infoHash:    seedIh,
-                  uploadSpeed: seedT.uploadSpeed ?? 0,
-                  uploaded:    seedT.uploaded    ?? 0,
-                  numPeers:    seedT.numPeers    ?? 0,
-                })
-              }, 2000)
-              _seedIntervals.set(seedIh, interval)
-              win?.webContents.send('torrent:autoSeedStarted', {
-                infoHash: seedIh, gameId, gameTitle, savePath: dest,
-              })
-            }
-
-            if (seedT.infoHash) {
-              doAutoSeed(seedT.infoHash as string)
-            } else {
-              seedT.once('ready', () => { if (seedT.infoHash) doAutoSeed(seedT.infoHash as string) })
-            }
-            seedT.once('error', (e: Error) => console.warn('[auto-seed] error:', e.message))
-          } catch (e) {
-            console.warn('[auto-seed] failed to re-add torrent:', (e as Error).message)
-          }
-        } finally {
-          finalizeInFlight = false
-        }
-      }
-
-      torrent.once('done', () => {
-        void finalizeInstall()
-      })
-
-      torrent.once('ready', () => {
-        clearPreReady()
-        // Fallback resolve for .torrent buffers that didn't have infoHash before ready
-        if (!resolved) {
-          resolve({ infoHash: torrent.infoHash as string, destPath: dest })
-          resolved = true
-        }
-
-        if (torrent.done) void finalizeInstall()
-
-        // Stall detection state
-        const STALL_GRACE_MS   = 90_000  // wait 90s after ready before checking
-        const STALL_TIMEOUT_MS = 180_000 // 3min under threshold = stalled
-        const MIN_SPEED_BPS    = 50_000  // 50 KB/s — below this counts as "slow"
-        const readyAt   = Date.now()
-        let lastFastAt = Date.now()
-        let stallSent  = false
-
-        watchdog = setInterval(() => {
-          if (doneSent || torrent.destroyed) {
-            clearWatchdog()
-            return
-          }
-          if (torrent.progress >= 0.995 && typeof torrent._checkDone === 'function') {
-            torrent._checkDone()
-          }
-          if (torrent.done && !doneSent && !finalizeInFlight) {
-            void finalizeInstall()
-          }
-
-          // Rafraîchir pairs / débits pour l’UI (même si peu d’événements `download`).
-          if (!doneSent && !torrent.paused && torrent.infoHash && win) {
-            win.webContents.send('torrent:progress', buildTorrentProgressPayload(torrent))
-          }
-
-          // Stall detection — only while actively downloading (progress < 99%)
-          if (!doneSent && torrent.progress < 0.99) {
-            const now = Date.now()
-            // Reset stallSent if speed has recovered — allows re-alerting if it drops again
-            if (torrent.downloadSpeed >= MIN_SPEED_BPS) {
-              lastFastAt = now
-              stallSent  = false
-            }
-            if (!stallSent && (now - readyAt) > STALL_GRACE_MS) {
-              if (torrent.numPeers === 0) {
-                stallSent = true
-                win?.webContents.send('torrent:slow', {
-                  infoHash: torrent.infoHash,
-                  reason:   'no-peers',
-                  numPeers: 0,
-                  speed:    0,
-                })
-              } else if ((now - lastFastAt) > STALL_TIMEOUT_MS) {
-                stallSent = true
-                win?.webContents.send('torrent:slow', {
-                  infoHash: torrent.infoHash,
-                  reason:   'slow',
-                  numPeers: torrent.numPeers,
-                  speed:    torrent.downloadSpeed,
-                })
-              }
-            }
-          }
-        }, 2000)
-
-        torrent.on('download', () => {
-          if (torrent.progress >= 0.999 && typeof torrent._checkDone === 'function') {
-            torrent._checkDone()
-          }
-          const now = Date.now()
-          if ((now - (_lastProgress[torrent.infoHash] ?? 0)) < 1000) return
-          _lastProgress[torrent.infoHash] = now
-          win?.webContents.send('torrent:progress', buildTorrentProgressPayload(torrent))
-        })
-      })
-
-      torrent.once('close', () => {
-        clearPreReady()
-        clearWatchdog()
-      })
-
-      torrent.once('error', (err: Error) => {
-        clearPreReady()
-        clearWatchdog()
-        win?.webContents.send('torrent:error', {
-          infoHash: torrent.infoHash ?? 'unknown',
-          error:    err.message,
-        })
-        // If we already resolved (magnet path), propagate via event — can't reject twice
-        if (!resolved) reject(err)
-      })
-    })
+    const torrentSource =
+      typeof source === 'string' ? source : Buffer.from(source)
+    return torrentWorker.addTorrent(torrentSource, resolveInstallRoot(installRootUser), gameId, gameTitle, createShortcut)
   },
 )
-
-// ── Torrent: pause / resume / remove ─────────────────────────────────────────
-// WebTorrent v2 : `client.get()` est async (Promise<Torrent | null>).
-
-ipcMain.handle('torrent:pause', async (_e, infoHash: string) => {
-  const client = await getWtClient()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const torrent = await client.get(infoHash) as any
-  if (!torrent) return { ok: false }
-  torrent.pause()
-  return { ok: true }
-})
-
-ipcMain.handle('torrent:resume', async (_e, infoHash: string) => {
-  const client = await getWtClient()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const torrent = await client.get(infoHash) as any
-  if (!torrent) return { ok: false }
-  torrent.resume()
-  return { ok: true }
-})
-
-ipcMain.handle('torrent:remove', async (_e, infoHash: string) => {
-  const client = await getWtClient()
-  try {
-    // destroyStore : supprime les fichiers partiels (annulation d'installation)
-    await client.remove(infoHash, { destroyStore: true })
-    return { ok: true }
-  } catch {
-    return { ok: false }
-  }
-})
-
-// ── Torrent: seed (partage après installation) ────────────────────────────────
-// Ré-ajoute un torrent installé en mode seed-only : WebTorrent vérifie les
-// pièces sur disque et commence à partager sans re-télécharger.
-
-const _seedIntervals = new Map<string, ReturnType<typeof setInterval>>()
 
 ipcMain.handle(
-  'torrent:seed',
-  async (_e, source: string | ArrayBuffer, savePath: string) => {
-    const client = await getWtClient()
-    const torrentSource = typeof source === 'string' ? source : Buffer.from(source)
-
-    return new Promise<{ ok: boolean; infoHash?: string; error?: string }>((resolve) => {
-      let resolved = false
-      const done = (v: { ok: boolean; infoHash?: string; error?: string }) => {
-        if (!resolved) { resolved = true; resolve(v) }
-      }
-
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- API dynamique WebTorrent
-        const torrent: any = client.add(torrentSource, {
-          path: savePath,
-          storeCacheSlots: 0,
-        })
-
-        const startInterval = (ih: string) => {
-          const existing = _seedIntervals.get(ih)
-          if (existing) clearInterval(existing)
-          const interval = setInterval(() => {
-            if (torrent.destroyed) { clearInterval(interval); _seedIntervals.delete(ih); return }
-            win?.webContents.send('torrent:seedProgress', {
-              infoHash:    ih,
-              uploadSpeed: torrent.uploadSpeed ?? 0,
-              uploaded:    torrent.uploaded    ?? 0,
-              numPeers:    torrent.numPeers    ?? 0,
-            })
-          }, 2000)
-          _seedIntervals.set(ih, interval)
+  'torrent:addFromUrl',
+  async (
+    _e,
+    torrentUrl: string,
+    installRootUser: string,
+    gameId: string,
+    gameTitle: string,
+    createShortcut = true,
+    requestId: string | null = null,
+  ) => {
+    const ac = new AbortController()
+    if (requestId) _torrentAddFetchAborts.set(requestId, ac)
+    try {
+      const res = await fetch(torrentUrl, { signal: ac.signal })
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`
+        try {
+          const j = (await res.json()) as { error?: string }
+          if (j?.error) msg = j.error
+        } catch {
+          msg = res.statusText || msg
         }
-
-        if (torrent.infoHash) {
-          done({ ok: true, infoHash: torrent.infoHash as string })
-          startInterval(torrent.infoHash as string)
-        }
-
-        torrent.once('ready', () => {
-          const ih = torrent.infoHash as string
-          if (ih) { done({ ok: true, infoHash: ih }); startInterval(ih) }
-        })
-
-        torrent.once('error', (err: Error) => done({ ok: false, error: err.message }))
-      } catch (err) {
-        done({ ok: false, error: (err as Error).message })
+        throw new Error(msg)
       }
-    })
+      const buf = Buffer.from(await res.arrayBuffer())
+      return await torrentWorker.addTorrent(buf, resolveInstallRoot(installRootUser), gameId, gameTitle, createShortcut)
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') {
+        const err = new Error('Aborted')
+        err.name = 'AbortError'
+        throw err
+      }
+      throw e
+    } finally {
+      if (requestId) _torrentAddFetchAborts.delete(requestId)
+    }
   },
 )
 
-ipcMain.handle('torrent:stopSeed', async (_e, infoHash: string) => {
-  const interval = _seedIntervals.get(infoHash)
-  if (interval) { clearInterval(interval); _seedIntervals.delete(infoHash) }
-  win?.webContents.send('torrent:seedStopped', { infoHash })
-  const client = await getWtClient()
-  try {
-    await client.remove(infoHash, { destroyStore: false })
-    return { ok: true }
-  } catch { return { ok: false } }
+ipcMain.handle('torrent:cancelAddFromUrl', (_e, requestId: string) => {
+  _torrentAddFetchAborts.get(requestId)?.abort()
+  return { ok: true as const }
 })
+
+ipcMain.handle('torrent:pause', async (_e, infoHash: string) => torrentWorker.pause(infoHash))
+
+ipcMain.handle('torrent:resume', async (_e, infoHash: string) => torrentWorker.resume(infoHash))
+
+ipcMain.handle('torrent:remove', async (_e, infoHash: string) => torrentWorker.remove(infoHash))
+
+ipcMain.handle('torrent:seed', async (_e, source: string | ArrayBuffer, savePath: string) => {
+  const torrentSource = typeof source === 'string' ? source : Buffer.from(source as ArrayBuffer)
+  return torrentWorker.seed(torrentSource, savePath)
+})
+
+ipcMain.handle('torrent:stopSeed', async (_e, infoHash: string) => torrentWorker.stopSeed(infoHash))
 
 // ── Manual extraction (retry after failed or already-downloaded torrent) ──────
 ipcMain.handle('install:extract', async (_e, infoHash: string, destPath: string, gameTitle: string, createShortcut = true) => {

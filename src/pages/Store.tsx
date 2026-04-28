@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Search, ChevronLeft, X } from 'lucide-react'
+import { getApiBase } from '../api/client'
 import { gamesApi, type Game, type Category, type PopularHeroGame, type StoreRow } from '../api/games'
 import { useApp } from '../context/AppContext'
 import { GameGrid } from '../components/game/GameGrid'
@@ -95,7 +96,8 @@ export function Store() {
     setSearch('')
   }
 
-  const downloadStartAborters = useRef<Map<string, AbortController>>(new Map())
+  /** Identifiant d’annulation du fetch .torrent côté process principal (évite de cloner le buffer via IPC). */
+  const downloadStartRequestIds = useRef<Map<string, string>>(new Map())
   const [downloadStartingIds, setDownloadStartingIds] = useState(() => new Set<string>())
 
   const addDownloadStarting = useCallback((id: string) => {
@@ -117,24 +119,26 @@ export function Store() {
   }, [])
 
   const cancelDownloadStart = useCallback((gameId: string) => {
-    downloadStartAborters.current.get(gameId)?.abort()
+    const rid = downloadStartRequestIds.current.get(gameId)
+    if (rid) void window.electron.torrent.cancelAddFromUrl(rid)
   }, [])
 
   const handleDownload = useCallback(async (game: Game | PopularHeroGame) => {
     if (state.downloads.some(d => d.gameId === game.id && d.status !== 'done')) return
-    if (downloadStartAborters.current.has(game.id)) return
+    if (downloadStartRequestIds.current.has(game.id)) return
 
-    const ac = new AbortController()
-    downloadStartAborters.current.set(game.id, ac)
+    const requestId = crypto.randomUUID()
+    downloadStartRequestIds.current.set(game.id, requestId)
     addDownloadStarting(game.id)
     try {
-      const torrentBuffer = await gamesApi.getTorrent(game.id, { signal: ac.signal })
-      const { infoHash } = await window.electron.torrent.add(
-        torrentBuffer,
+      const torrentUrl = `${getApiBase()}/api/games/${game.id}/torrent`
+      const { infoHash } = await window.electron.torrent.addFromUrl(
+        torrentUrl,
         state.downloadDir,
         game.id,
         game.title_clean,
         getBoolPref(PREF_AUTO_SHORTCUT, true),
+        requestId,
       )
       dispatch({
         type: 'ADD_TORRENT',
@@ -157,7 +161,7 @@ export function Store() {
       if (e instanceof Error && e.name === 'AbortError') return
       console.error('Download error:', e)
     } finally {
-      downloadStartAborters.current.delete(game.id)
+      downloadStartRequestIds.current.delete(game.id)
       removeDownloadStarting(game.id)
     }
   }, [addDownloadStarting, dispatch, removeDownloadStarting, state.downloadDir, state.downloads])
